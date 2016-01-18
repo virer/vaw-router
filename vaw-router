@@ -1,0 +1,5 @@
+#!/usr/bin/env python
+
+import vaw_router
+
+vaw_router.vaw.router_init()
