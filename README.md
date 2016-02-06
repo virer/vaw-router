@@ -9,9 +9,12 @@ to the manager(ie.:by phone), manager connect to VAW router enter the client giv
 
 #How to run
 
-    ./vaw-router 4443 --web ../noVNC/
+##1st generate a SSL certificate:
+    openssl req -new -x509 -days 365 -nodes -out self.pem -keyout self.pem
 
-Note: You must have generated the SSL certificate to support websocket SSL
+##2nd rune var-router:
+
+    ./vaw-router 4443 --web ../noVNC/
 
 #Status
 Early alpha project
