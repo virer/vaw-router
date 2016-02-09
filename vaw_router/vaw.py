@@ -20,7 +20,7 @@ except: from SocketServer import ForkingMixIn
 try:    from http.server import HTTPServer
 except: from BaseHTTPServer import HTTPServer
 import select
-from vaw_router import websocket
+from vaw_router import vaw_websocket
 try:
     from urllib.parse import parse_qs, urlparse
 except:
@@ -35,7 +35,7 @@ from multiprocessing import Manager
 def id_gen():
     return str(random.randrange(100000000, 999999999, 2))
 
-class ProxyRequestHandler(websocket.WebSocketRequestHandler):
+class ProxyRequestHandler(vaw_websocket.WebSocketRequestHandler):
 
     def new_websocket_client(self, path=None):
         """
@@ -62,23 +62,22 @@ class ProxyRequestHandler(websocket.WebSocketRequestHandler):
 
                 if mode == "manager":
                     if wanted_pw == self.session[wanted_id]["pw"]:
-
                         # Generate the id of the manager
                         _id = id_gen()
 
-                        self.client_pipe = None
+                        self.wanted_id = wanted_id
 
-                        reduced = self.session[wanted_id]["pipe"]
-                        self.pipe = reduced[0](*reduced[1])
+                        if self.pipe == None:
+                            reduced = self.session[wanted_id]["pipe"]
+                            self.pipe = reduced[0](*reduced[1])
+
+                        self.connected = True
                         self.pipe.send('{ "vnc": "connect" }')
                         
                         # Init manager queue in the session
                         self.session[_id]= { "mode": "manager", "id": _id, "wanted_id": wanted_id, "wanted_pw": wanted_pw, "authenticated": True  }
 
                         msg = "New manager id: %s wanted client id: %s" % (_id, wanted_id)
-
-                        # Tell client to launch VNC connection
-                        #self.session[wanted_id]["queue"].put('{ "vnc": "connect" }')
                     else:
                         _id = None
                         self.session[_id] = None 
@@ -86,8 +85,15 @@ class ProxyRequestHandler(websocket.WebSocketRequestHandler):
                 elif mode == "client":
                     # Use client provided id
                     _id = wanted_id
+
+                    # Since we are a client we dont have a wanted id
+                    self.wanted_id = None
+
+                    # Waiting for manager
+                    self.connected = False
+
+                    self.pipe, manager_conn = Pipe()
                     try:
-                        manager_conn, self.pipe = Pipe()
 
                         # Init the client queue in the session
                         self.session[wanted_id]= { "mode": "client", "id": wanted_id, "pw": wanted_pw, "authenticated": True, "pipe": reduction.reduce_connection(manager_conn) }
@@ -124,11 +130,10 @@ class ProxyRequestHandler(websocket.WebSocketRequestHandler):
             del self.session[_id]
             self.send_close()
             print "Error in vaw router"
+            print sys.exc_type,sys.exc_value
 
     def getManagerIdByClientId(self, client_id):
-        #self.log("client id= %s" % client_id)
         for manager_id, data in self.session.items():
-            #self.log("manager id? %s" % manager_id)
             if ("wanted_id" in self.session[manager_id] and self.session[manager_id]["wanted_id"] == client_id):
                 if(self.session[manager_id]["authenticated"] == True):
                     return str(manager_id)
@@ -148,126 +153,84 @@ class ProxyRequestHandler(websocket.WebSocketRequestHandler):
         else:
             self.heartbeat = None
 
+        if self.heartbeat is not None:
+            now = time.time()
+            if now > self.heartbeat:
+                self.heartbeat = now + self.server.heartbeat
+                self.send_ping()
+
+        self.request.settimeout(0.0045)
+        self.request.setblocking(0)
+
         while True:
-            wlist = []
-        
-            if self.heartbeat is not None:
-                now = time.time()
-                if now > self.heartbeat:
-                    self.heartbeat = now + self.server.heartbeat
-                    self.send_ping()
-
-            if cqueue or c_pend: wlist.append(self.request)
             try:
-                ins, outs, excepts = select.select(rlist, wlist, [], 1)
-            except (select.error, OSError):
-                exc = sys.exc_info()[1]
-                if hasattr(exc, 'errno'):
-                    err = exc.errno
-                else:
-                    err = exc[0]
-
-                if err != errno.EINTR:
-                    raise
-                else:
-                    continue
-
-            if excepts: raise Exception("Socket exception")
-
-            if self.request in outs:
-                # Send queued target data to the client
-                c_pend = self.send_frames(cqueue)
-
-                cqueue = []
-                        
-            if self.request in ins:
                 # Receive client data, decode it, and queue for target
                 bufs, closed = self.recv_frames()
+            except:
+                closed = False
+                bufs = []
+
+            if closed:
+                 del self.session[_id]
+                 self.log_message("Connection closed")
+            else:
+                # Trigger push
+                self.push(_id)
+                if not self.connected:
+                    # Save CPU while waiting for manager connexion
+                    time.sleep(0.3)
                 for buff in bufs:
-                    if self.session[_id]["mode"] == "manager" and self.session[_id]["authenticated"] == True:
-                        # get id of the wanted client
-                        wanted_id = self.session[_id]["wanted_id"]
-
-                        # put data in the queue
                         try:
-                            if wanted_id in self.session:
-                                #self.session[wanted_id]["queue"].put(buff)
-                                if self.pipe == None:
-                                    reduced = self.session[wanted_id]["pipe"]
-                                    self.pipe = reduced[0](*reduced[1])
-                                self.pipe.send(buff) 
-                            else:
-                                del self.session[_id]
-                                self.log_message("Client has gone, closing manager connection.")
-                                self.send_close()
-                        except:
-                            self.log_message("manager>client: Queue push error %s" % wanted_id)
-                            print sys.exc_type, sys.exc_value
-                    elif self.session[_id]["mode"] == "client":
-                        manager_id = None
-                        try:
-                            manager_id = self.getManagerIdByClientId(_id)
-                            
-                            if manager_id != False:
-                                # Client send data to his manager
-                                #self.session[manager_id]["queue"].put(buff)
+                            if self.connected:
                                 self.pipe.send(buff)
+                            elif self.pipe != None and self.wanted_id != False or ( self.wanted_id in self.session and self.wanted_id != None ):
+                                self.connected = True
+                                self.pipe.send(buff)
+                            elif self.session[_id]["mode"] == "client":
+                                self.wanted_id = self.getManagerIdByClientId(_id)
+                                if self.wanted_id != False:
+                                    self.connected = True
+                                    self.pipe.send(buff)
+                                else:
+                                    del self.session[_id]
+                                    self.log_message("Manager has gone, closing client connection.")
+                                    self.send_close()
+                            elif self.session[_id]["mode"] == "manager" and self.session[_id]["authenticated"] == True:
+                                # get pipe of the wanted client
+                                if self.wanted_id in self.session:
+                                    if self.pipe == None:
+                                         reduced = self.session[self.wanted_id]["pipe"]
+                                         self.pipe = reduced[0](*reduced[1])
+                                    self.connected = True
+                                    self.pipe.send(buff)
+                                else:
+                                    del self.session[_id]
+                                    self.log_message("Client has gone, closing manager connection.")
+                                    self.send_close()
                             else:
-                                self.log_message("Client send data but no manager found")
-                                # Client send data but no manager found => close connection
+                                self.log_message("Error")
+                                del self.session[_id]
+                                self.pipe = None
                                 self.send_close()
                         except:
-                            self.log_message("client>manager: Queue push error %s" % manager_id)
-                            print self.session
+                            self.send_close()
+                            del self.session[_id]
+                            self.pipe = None
                             print sys.exc_type, sys.exc_value
-
-                    if closed:
-                        del self.session[_id]
-                        self.log_message("Connection closed")
-                        #raise self.CClose(closed['code'], closed['reason'])
-            
-            # Trigger push
-            self.push(_id)
 
     def push(self, _id):
-        qdata = ""
-        if self.session[_id] == None:
-            return
-        try:
-            if self.pipe.poll(0.1):
+        if self.pipe != None:
+          try:
+            if self.pipe.poll(0.0045):
                 qdata = ""
                 qdata = self.pipe.recv()
-                if len(qdata) > 0:
-                   #print qdata
-                   buf = self.send_frames([qdata])
-        except:
+                self.send_frames([qdata])
+          except:
             print "Exception in push"
             del self.session[_id]
             self.send_close()
-        #
-        try:
-        #    while not self.session[_id]["queue"].empty():
-                qdata = ""
-        #        qdata = self.session[_id]["queue"].get()
-        #        if len(qdata) > 0:
-        #            #print "%s:> (%d)= %s" % ( self.session[_id]["mode"], len(qdata), [ord(a) for a in qdata] )
-        #            buf = self.send_frames([qdata])
-                    #while buf != 0:
-                    #    buf = self.send_frames([])
 
-        except IOError, e:
-            if e.errno == errno.EPIPE:
-                # Socket closed reset
-                del self.session[_id]
-                return
-        except:
-            print "Error sending data %s" % _id
-            print self.session
-            print sys.exc_type, sys.exc_value
-            del self.session[_id]
-            self.send_close()
-
-class WebSocketProxy(websocket.WebSocketServer):
+class WebSocketProxy(vaw_websocket.WebSocketServer):
     """
     Proxy traffic to and from a WebSockets client to a normal TCP
     socket server target. All traffic to/from the client is base64
@@ -324,7 +287,7 @@ class WebSocketProxy(websocket.WebSocketServer):
                 "REBIND_OLD_PORT": str(kwargs['listen_port']),
                 "REBIND_NEW_PORT": str(self.target_port)})
 
-        websocket.WebSocketServer.__init__(self, RequestHandlerClass, *args, **kwargs)
+        vaw_websocket.WebSocketServer.__init__(self, RequestHandlerClass, *args, **kwargs)
 
     def run_wrap_cmd(self):
         self.msg("Starting '%s'", " ".join(self.wrap_cmd))
@@ -442,7 +405,7 @@ def router_init():
         logging.getLogger(WebSocketProxy.log_prefix).setLevel(logging.DEBUG)
 
 
-    if not websocket.ssl and opts.ssl_target:
+    if not vaw_websocket.ssl and opts.ssl_target:
         parser.error("SSL target requested and Python SSL module not loaded.");
 
     if opts.ssl_only and not os.path.exists(opts.cert):

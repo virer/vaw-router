@@ -106,6 +106,7 @@ class WebSocketRequestHandler(SimpleHTTPRequestHandler):
         self.auto_pong = getattr(server, "auto_pong", False)
         self.strict_mode = getattr(server, "strict_mode", True)
 
+        self.pipe = None
         self.session = getattr(server, "session", None)
 
         self.logger = getattr(server, "logger", None)
